@@ -1,0 +1,164 @@
+"""
+Colab set up
+!pip install transformers
+!pip install torch
+!pip install llama-cpp-python
+!wget -O Bielik-11B-v2.3-Instruct.Q4_K_M.gguf https://huggingface.co/speakleash/Bielik-11B-v2.3-Instruct-GGUF/resolve/main/Bielik-11B-v2.3-Instruct.Q4_K_M.gguf
+"""
+
+import json
+from typing import Callable, Dict, List, Union
+import re
+import random
+
+def get_fn_signature(fn: Callable):
+    fn_signature: Dict = {
+        "name": fn.__name__,
+        "description": fn.__doc__ or "",
+        "parameters": {
+            "properties": {}
+        }
+    }
+    schema = {
+        k: {"type": v.__name__}
+        for k, v in fn.__annotations__.items() if k != "return"
+    }
+    fn_signature["parameters"]["properties"] = schema
+    return fn_signature
+
+class Tool:
+    def __init__(self, fn: Callable):
+        self.fn = fn
+        self.name = fn.__name__
+        self.signature = get_fn_signature(fn)
+        self.fn_signature = self.signature  # For compatibility
+
+    def run(self, **kwargs):
+        return self.fn(**kwargs)
+
+def tool(fn: Callable):
+    return Tool(fn)
+
+# Sample tools
+@tool
+def add_numbers(a: int, b: int) -> int:
+    """Adds two numbers."""
+    return a + b
+
+@tool
+def roll_dice(sides: int = 6, rolls: int = 1) -> str:
+    """
+    Simulates rolling dice with a specified number of sides and number of rolls.
+    Returns the result of each roll.
+    """
+    if sides < 1 or rolls < 1:
+        return "Error: 'sides' and 'rolls' must be positive integers."
+    results = [random.randint(1, sides) for _ in range(rolls)]
+    return f"Rolling a {sides}-sided dice {rolls} time(s): {results}"
+
+
+# List of tools
+tools = [add_numbers, roll_dice]
+
+from llama_cpp import Llama
+
+class ToolAgent:
+    def __init__(self, tools: Union[Tool, List[Tool]], model_path: str):
+        self.tools = tools if isinstance(tools, list) else [tools]
+        self.tools_dict = {tool.name: tool for tool in self.tools}
+        self.model = Llama(model_path=model_path)
+            
+    def build_system_prompt(self):
+        tools_info = ""
+        for tool in self.tools:
+            tools_info += json.dumps(tool.fn_signature) + "\n"
+        return f"""
+You are an AI assistant capable of calling functions to help with the user's request.
+Available functions are provided within <tools></tools> tags.
+
+When necessary, output a function call in the following format within <tool_call></tool_call> tags:
+
+<tool_call>
+{{"name": "<function_name>", "arguments": <arguments_dict>}}
+</tool_call>
+
+Here are the available tools:
+
+<tools>
+{tools_info}
+</tools>
+"""
+
+    def parse_tool_call(self, response: str):
+        pattern = r"<tool_call>(.*?)</tool_call>"
+        match = re.search(pattern, response, re.DOTALL)
+        if match:
+            tool_call_str = match.group(1).strip()
+            try:
+                tool_call = json.loads(tool_call_str)
+                return tool_call
+            except json.JSONDecodeError:
+                print("Failed to parse tool call JSON.")
+        return None
+
+    def generate_response(self, prompt: str):
+        # Use the model to generate a response
+        response = self.model(
+            prompt,
+            max_tokens=256,
+            stop=["\nUser:", "\nAI:"],
+            echo=False,
+            temperature=0.7,
+        )
+        return response['choices'][0]['text']
+
+    def run(self, user_input: str):
+        self.model.reset() # added
+        system_prompt = self.build_system_prompt()
+        full_prompt = f"{system_prompt}\nUser: {user_input}\nAI:"
+        response_text = self.generate_response(full_prompt)
+        
+        # Parse and execute tool call if present
+        tool_call = self.parse_tool_call(response_text)
+        if tool_call:
+            tool_name = tool_call.get("name")
+            arguments = tool_call.get("arguments", {})
+            tool = self.tools_dict.get(tool_name)
+            if tool:
+                try:
+                    result = tool.run(**arguments)
+                    final_response = f"The result is: {result}"
+                except Exception as e:
+                    final_response = f"Error executing tool '{tool_name}': {e}"
+            else:
+                final_response = f"Tool '{tool_name}' not found."
+        else:
+            final_response = response_text.strip()
+        
+        return final_response
+
+
+# execution
+
+import time
+
+model_path = "/content/Bielik-11B-v2.3-Instruct.Q4_K_M.gguf"
+
+# Initialize the agent
+agent = ToolAgent(tools, model_path)
+
+# User input
+user_input1 = "What is the sum of 10 and 15?"
+
+# Run the agent
+response1 = agent.run(user_input1)
+print(response1)
+
+time.sleep(10)
+
+# User input
+user_input2 = "Can you roll a dice for me?"
+
+# Run the agent
+response2 = agent.run(user_input2)
+print(response2)
